@@ -328,6 +328,29 @@ fn mark_comment_groups(slots: &Slots, cmds: &[Cmd], force: &mut Vec<bool>, stack
     }
 }
 
+/// What layout after a line start outside every group depends on from the
+/// lines before it: the break-point indentation in force, the padding the
+/// line started with, and the state of the outermost group, which spans the
+/// whole document — whether it broke, and whether it can still break.
+#[derive(Debug, Clone, Copy)]
+struct Carry {
+    indentation: isize,
+    pad: Option<isize>,
+    root_broken: bool,
+    root_queued: bool,
+}
+
+impl Default for Carry {
+    fn default() -> Self {
+        Carry {
+            indentation: 0,
+            pad: Some(0),
+            root_broken: false,
+            root_queued: true,
+        }
+    }
+}
+
 /// The fewest stale splices a sweep waits for, so that a small document is
 /// not swept on every reclaimed slot.
 const MIN_SWEEP_THRESHOLD: usize = 64;
@@ -348,6 +371,9 @@ pub struct Printer {
     /// document. An aborted speculative region can discard some of them.
     stale_splices: usize,
     sweep_threshold: usize,
+    /// The layout state where the lines already taken by
+    /// [`Printer::take_final`] end.
+    carry: Carry,
     pending_resolve: bool,
     sealed: bool,
     /// The laid-out document, rendered once on the first [`Printer::resolve`]
@@ -369,6 +395,7 @@ impl Printer {
             had_slots: false,
             stale_splices: 0,
             sweep_threshold: MIN_SWEEP_THRESHOLD,
+            carry: Carry::default(),
             pending_resolve: false,
             sealed: false,
             rendered: None,
@@ -907,12 +934,119 @@ impl Printer {
     }
 
     fn render(&self) -> Result<String, PrinterError> {
+        Ok(self.render_cmds(&self.main)?.finish())
+    }
+
+    fn render_cmds<'s>(&'s self, cmds: &'s [Cmd]) -> Result<Renderer<'s>, PrinterError> {
         let mut force = vec![false];
         let mut stack = Vec::new();
-        mark_comment_groups(&self.slots, &self.main, &mut force, &mut stack);
-        let mut renderer = Renderer::new(self.max_width, &self.slots, force);
-        renderer.run(&self.main)?;
-        Ok(renderer.finish())
+        mark_comment_groups(&self.slots, cmds, &mut force, &mut stack);
+        let mut renderer = Renderer::new(self.max_width, &self.slots, force, self.carry);
+        renderer.run(cmds)?;
+        Ok(renderer)
+    }
+
+    /// Lay out and remove the part of the main output that nothing can
+    /// change any more, returning its text. That is the longest prefix
+    /// ending at a line start outside every group whose slots have no
+    /// handle left to write through them (or are dead): later content
+    /// cannot change how it breaks. Reading the document piecewise this
+    /// way, and the rest with [`Printer::take_rest`], gives exactly what
+    /// [`Printer::value`] would have, while the document only keeps what
+    /// may still change.
+    pub fn take_final(&mut self) -> String {
+        if self.sealed {
+            return String::new();
+        }
+        let cut = self.final_prefix_len();
+        if cut == 0 {
+            return String::new();
+        }
+        let Ok(renderer) = self.render_cmds(&self.main[..cut]) else {
+            return String::new();
+        };
+        let (text, carry) = renderer.finish_chunk();
+        self.carry = carry;
+        let prefix: Vec<Cmd> = self.main.drain(..cut).collect();
+        let mut work = splice_ids(&prefix);
+        while let Some(id) = work.pop() {
+            if let Some(slot) = self.slots.get(id) {
+                work.extend(splice_ids(&slot.commands));
+                self.slots.remove(id);
+            }
+        }
+        text
+    }
+
+    /// Seal the document and lay out what [`Printer::take_final`] has not
+    /// taken.
+    pub fn take_rest(&mut self) -> Result<String, PrinterError> {
+        self.seal();
+        let text = self.render()?;
+        self.main.clear();
+        Ok(text)
+    }
+
+    fn final_prefix_len(&self) -> usize {
+        let mut depth: isize = 0;
+        let mut line_start = true;
+        let mut cut = 0;
+        for (i, cmd) in self.main.iter().enumerate() {
+            match cmd {
+                Cmd::Splice(id) => {
+                    if let Some(slot) = self.slots.get(*id) {
+                        if !self.is_final(slot) {
+                            break;
+                        }
+                        depth += self.group_delta(&slot.commands);
+                        if let Some(last) = self.slots.last_significant(slot.commands.iter().rev())
+                        {
+                            line_start = self.ends_line(last);
+                        }
+                    }
+                }
+                Cmd::BeginGroup { .. } => {
+                    depth += 1;
+                    line_start = false;
+                }
+                Cmd::EndGroup { .. } => {
+                    depth -= 1;
+                    line_start = false;
+                }
+                Cmd::HardBreak => line_start = true,
+                Cmd::ShiftIndent(_) => {}
+                _ => line_start = false,
+            }
+            if depth < 0 {
+                break;
+            }
+            if depth == 0 && line_start {
+                cut = i + 1;
+            }
+        }
+        cut
+    }
+
+    fn is_final(&self, slot: &Slot) -> bool {
+        (slot.dead || (slot.holders == 0 && slot.speculation.is_empty()))
+            && slot.commands.iter().all(|cmd| match cmd {
+                Cmd::Splice(id) => self.slots.get(*id).is_none_or(|child| self.is_final(child)),
+                _ => true,
+            })
+    }
+
+    fn group_delta(&self, cmds: &[Cmd]) -> isize {
+        cmds.iter()
+            .map(|cmd| match cmd {
+                Cmd::BeginGroup { .. } => 1,
+                Cmd::EndGroup { .. } => -1,
+                Cmd::Splice(id) => self
+                    .slots
+                    .get(*id)
+                    .map_or(0, |slot| self.group_delta(&slot.commands)),
+                _ => 0,
+            })
+            .sum()
     }
 }
 
@@ -940,29 +1074,42 @@ struct Renderer<'a> {
 }
 
 impl<'a> Renderer<'a> {
-    fn new(max_width: usize, slots: &'a Slots, force_break: Vec<bool>) -> Renderer<'a> {
+    /// A renderer for a document whose earlier lines were already laid out
+    /// (see [`Printer::take_final`]), leaving `carry` behind.
+    fn new(
+        max_width: usize,
+        slots: &'a Slots,
+        force_break: Vec<bool>,
+        carry: Carry,
+    ) -> Renderer<'a> {
+        let indentation = carry.indentation;
+        let pad = carry.pad.unwrap_or(0);
         Renderer {
             max_width,
             slots,
             force_break,
             out: String::new(),
-            output_width: 0,
+            output_width: pad.max(0) as usize,
             at_line_start: true,
-            pending_pad: Some(0),
+            pending_pad: carry.pad,
             block_indent: 0,
             buffer: VecDeque::new(),
             buffer_width: 0,
             pending_comments: String::new(),
-            indentation: 0,
+            indentation,
             groups: vec![Group {
                 depth: 0,
                 indent: 0,
                 pending: 0,
-                want_break: false,
+                want_break: carry.root_broken,
                 comment: false,
             }],
             group_stack: vec![0],
-            group_queue: vec![vec![0]],
+            group_queue: vec![if carry.root_queued {
+                vec![0]
+            } else {
+                Vec::new()
+            }],
         }
     }
 
@@ -994,6 +1141,20 @@ impl<'a> Renderer<'a> {
             Cmd::LinePrefix(s) => self.line_prefix(s),
         }
         Ok(())
+    }
+
+    /// The text laid out so far, ending at a line start, and the layout
+    /// state there. The line's padding is left
+    /// to the renderer of what follows.
+    fn finish_chunk(mut self) -> (String, Carry) {
+        self.flush();
+        let carry = Carry {
+            indentation: self.indentation,
+            pad: self.pending_pad,
+            root_broken: self.groups[0].want_break,
+            root_queued: self.group_queue[0].contains(&0),
+        };
+        (self.out, carry)
     }
 
     fn finish(mut self) -> String {

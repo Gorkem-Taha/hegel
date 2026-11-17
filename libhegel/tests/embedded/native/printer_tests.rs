@@ -1392,6 +1392,97 @@ fn releasing_slot_handles_never_changes_the_document() {
     }
 }
 
+#[test]
+fn reading_the_final_prefix_piecewise_matches_the_whole_document() {
+    for seed in 0..300u64 {
+        let mut rng = SmallRng::seed_from_u64(seed + 3000);
+        let max_width = rng.random_range(1..40);
+        let ops = random_program(&mut rng);
+
+        let mut model = printer(max_width);
+        for op in &ops {
+            apply(&mut model, M, op);
+        }
+
+        let mut subject = printer(max_width);
+        let mut taken = String::new();
+        let mut pending: Vec<(SlotId, Vec<Op>)> = Vec::new();
+        let mut i = 0;
+        while i < ops.len() {
+            maybe_insert_aborted_junk(&mut subject, &mut rng);
+            let roll = rng.random_range(0..10);
+            if roll < 2 {
+                let len = rng.random_range(1..=(ops.len() - i).min(5));
+                let slot = subject.deferred(M).unwrap();
+                pending.push((slot, ops[i..i + len].to_vec()));
+                i += len;
+            } else if roll < 3 {
+                let blank = subject.block(M, 2).unwrap();
+                subject.release(blank);
+            } else {
+                apply(&mut subject, M, &ops[i]);
+                i += 1;
+            }
+            if !pending.is_empty() && rng.random_bool(0.3) {
+                let (slot, chunk) = pending.swap_remove(rng.random_range(0..pending.len()));
+                for op in &chunk {
+                    apply(&mut subject, Target::Slot(slot), op);
+                }
+                subject.release(slot);
+            }
+            if rng.random_bool(0.3) {
+                taken.push_str(&subject.take_final());
+            }
+        }
+        for (slot, chunk) in pending {
+            for op in &chunk {
+                apply(&mut subject, Target::Slot(slot), op);
+            }
+            subject.release(slot);
+            taken.push_str(&subject.take_final());
+        }
+        taken.push_str(&subject.take_rest().unwrap());
+        assert_eq!(taken, model.value().unwrap(), "seed {seed}");
+    }
+}
+
+#[test]
+fn the_final_prefix_stops_at_a_slot_still_held() {
+    let mut p = printer(79);
+    p.note(M, "first", None).unwrap();
+    let held = p.deferred(M).unwrap();
+    p.note(M, "after", None).unwrap();
+    assert_eq!(p.take_final(), "first\n");
+    assert_eq!(p.take_final(), "");
+    p.note(Target::Slot(held), "inside", None).unwrap();
+    p.release(held);
+    assert_eq!(p.take_final(), "inside\nafter\n");
+    assert_eq!(live_slots(&p), 0);
+    assert!(p.main.is_empty());
+}
+
+#[test]
+fn the_final_prefix_ends_outside_every_group() {
+    let mut p = printer(79);
+    p.begin_group(M, 2, "[").unwrap();
+    p.text(M, "a").unwrap();
+    p.hard_break(M).unwrap();
+    assert_eq!(p.take_final(), "");
+    p.end_group(M, "]").unwrap();
+    p.hard_break(M).unwrap();
+    assert_eq!(p.take_final(), "[a\n  ]\n");
+}
+
+#[test]
+fn indentation_carries_over_a_taken_prefix() {
+    let mut p = printer(79);
+    p.shift_indent(M, 4).unwrap();
+    p.note(M, "a", None).unwrap();
+    assert_eq!(p.take_final(), "a\n");
+    p.note(M, "b", None).unwrap();
+    assert_eq!(p.take_rest().unwrap(), "    b\n    ");
+}
+
 fn live_slots(p: &Printer) -> usize {
     p.slots.entries.iter().filter(|e| e.slot.is_some()).count()
 }
